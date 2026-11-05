@@ -1,0 +1,23 @@
+# Add this service to the CRM's render.yaml (VoroniX repository), next to
+# "voronix" and "voronix-ai". It uses the SAME database voronix-db, so the AI's
+# data lives in the CRM's database. After the first deploy, open the service's
+# Shell and run:  node dist/src/cli/keys.js create Barberista
+services:
+  - type: web
+    name: voronix-data
+    runtime: docker
+    plan: free
+    repo: https://github.com/Yernazar-KBTU/voronix-data.git
+    branch: main
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: voronix-db
+          property: connectionString
+      - key: CRM_SYNC
+        value: loose
+      - key: CORS_ORIGINS
+        value: "*"
