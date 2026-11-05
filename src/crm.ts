@@ -104,15 +104,17 @@ export async function syncBooking(c: Client, b: BookingForSync, mode: CrmSync): 
       ).rows[0].appointment_id;
       await c.query(`UPDATE ai_bookings SET crm_appointment_id = $2, sync_status = 'synced', sync_error = NULL WHERE id = $1`, [b.id, ap]);
     } else {
+      // The booking may now be for another client: the CRM visit follows.
+      const crmClient = await ensureCrmClient(c, b.client);
       await c.query(
-        `UPDATE appointments SET master_id = $4, service_code = $5, start_at = $2::timestamp, end_at = ${end},
+        `UPDATE appointments SET client_id = $7, master_id = $4, service_code = $5, start_at = $2::timestamp, end_at = ${end},
                 status = CASE WHEN $6 = 'cancelled' THEN 'Cancelled'
                               WHEN status = 'Cancelled' THEN 'Booked'
                               ELSE status END
           WHERE appointment_id = $1
-            AND (master_id, service_code, start_at, end_at, status = 'Cancelled')
-                IS DISTINCT FROM ($4, $5, $2::timestamp, ${end}, $6 = 'cancelled')`,
-        [linked, b.start, b.minutes, b.staff, b.service, b.status],
+            AND (client_id, master_id, service_code, start_at, end_at, status = 'Cancelled')
+                IS DISTINCT FROM ($7, $4, $5, $2::timestamp, ${end}, $6 = 'cancelled')`,
+        [linked, b.start, b.minutes, b.staff, b.service, b.status, crmClient],
       );
       await c.query(`UPDATE ai_bookings SET sync_status = 'synced', sync_error = NULL WHERE id = $1`, [b.id]);
     }
