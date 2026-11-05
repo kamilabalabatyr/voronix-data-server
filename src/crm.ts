@@ -5,6 +5,7 @@
 import type { Client, Tenant } from "./db.js";
 import type { CrmSync } from "./config.js";
 import { conflict } from "./errors.js";
+import { createPerson, resolvePerson } from "./identity.js";
 
 export const MESSENGER: Record<string, "Telegram" | "WhatsApp" | "Instagram"> = {
   telegram: "Telegram",
@@ -12,49 +13,9 @@ export const MESSENGER: Record<string, "Telegram" | "WhatsApp" | "Instagram"> = 
   instagram: "Instagram",
 };
 
-const handles = (h: string) => [...new Set([h, h.replace(/^@/, "")].filter(Boolean))];
-
-/** Finds the CRM client card for an AI client: its own link, a messenger account, or a CL- id. */
-export async function findCrmClient(c: Client, ai: { id: string; channel: string; handle: string }): Promise<string | null> {
-  const m = MESSENGER[ai.channel];
-  if (m && ai.handle) {
-    const r = await c.query<{ client_id: string }>(
-      `SELECT client_id FROM client_channels WHERE messenger = $1 AND external_user_id = ANY($2::text[]) LIMIT 1`,
-      [m, handles(ai.handle)],
-    );
-    if (r.rows[0]) return r.rows[0].client_id;
-  }
-  if (/^CL-\d{4,}$/.test(ai.id)) {
-    const r = await c.query(`SELECT 1 FROM clients WHERE client_id = $1`, [ai.id]);
-    if (r.rowCount) return ai.id;
-  }
-  return null;
-}
-
-/** Returns the CRM client for an AI client, creating the card (and its messenger account) if there is none. */
+/** The CRM client of an AI account: the same person found by messenger or phone, or a new card. */
 async function ensureCrmClient(c: Client, aiClientId: string): Promise<string> {
-  const ai = (
-    await c.query<{ id: string; name: string; channel: string; handle: string; crm_client_id: string | null }>(
-      `SELECT id, name, channel, handle, crm_client_id FROM ai_clients WHERE id = $1 FOR UPDATE`,
-      [aiClientId],
-    )
-  ).rows[0];
-  if (!ai) throw new Error(`AI client ${aiClientId} does not exist`);
-  if (ai.crm_client_id) return ai.crm_client_id;
-  let crm = await findCrmClient(c, ai);
-  if (!crm) {
-    crm = (await c.query<{ client_id: string }>(`INSERT INTO clients (display_name) VALUES ($1) RETURNING client_id`, [ai.name.slice(0, 50)])).rows[0].client_id;
-    const m = MESSENGER[ai.channel];
-    if (m && ai.handle) {
-      await c.query(`INSERT INTO client_channels (client_id, messenger, external_user_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`, [
-        crm,
-        m,
-        ai.handle.slice(0, 64),
-      ]);
-    }
-  }
-  await c.query(`UPDATE ai_clients SET crm_client_id = $2 WHERE id = $1`, [ai.id, crm]);
-  return crm;
+  return (await resolvePerson(c, aiClientId)) ?? (await createPerson(c, aiClientId));
 }
 
 export interface BookingForSync {

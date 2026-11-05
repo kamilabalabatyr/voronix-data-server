@@ -188,6 +188,25 @@ describe("bookings become CRM appointments", () => {
     expect(b).toMatchObject({ status: "cancelled", crmStatus: "Cancelled" });
   });
 
+  it("cancelling in the CRM cancels the AI booking and frees the time", async () => {
+    await store.put("bookings", booking({ id: "bk-5", start: "2027-03-05T12:00" }));
+    const ap = (await store.all("bookings")).find((x) => x.id === "bk-5")!.crmAppointmentId;
+    await env.sql(`UPDATE appointments SET status = 'Cancelled' WHERE appointment_id = $1`, [ap]);
+    expect((await store.all("bookings")).find((x) => x.id === "bk-5")).toMatchObject({ status: "cancelled", crmStatus: "Cancelled" });
+    // The same time can be booked again.
+    await store.put("bookings", booking({ id: "bk-6", client: "ig-new2", clientName: "Ещё клиент", source: "instagram", start: "2027-03-05T12:00" }));
+    // Restored in the CRM: booked again for the AI.
+    await env.sql(`UPDATE appointments SET status = 'Booked' WHERE appointment_id = $1`, [ap]).catch(() => {});
+  });
+
+  it("a booking moved to another client moves the CRM visit too", async () => {
+    await store.put("bookings", booking({ id: "bk-7", start: "2027-03-06T12:00" }));
+    await store.put("bookings", booking({ id: "bk-7", client: "tg-yernazar", clientName: "Yernazar", staff: "MS-01", start: "2027-03-06T14:00" }));
+    const b = (await store.all("bookings")).find((x) => x.id === "bk-7")!;
+    const ap = (await env.sql(`SELECT a.master_id, to_char(a.start_at, 'HH24:MI') AS t, c.display_name FROM appointments a JOIN clients c USING (client_id) WHERE appointment_id = $1`, [b.crmAppointmentId]))[0];
+    expect(ap).toEqual({ master_id: "MS-01", t: "14:00", display_name: "Yernazar" });
+  });
+
   it("keeps a booking the CRM cannot take (unknown service) and says why", async () => {
     await store.put("bookings", booking({ id: "bk-3", service: "XX-99", start: "2027-03-03T12:00" }));
     const b = (await store.all("bookings")).find((x) => x.id === "bk-3")!;

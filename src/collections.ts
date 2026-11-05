@@ -5,7 +5,8 @@
 import type { Client, Tenant } from "./db.js";
 import type { Config } from "./config.js";
 import { badRequest, conflict, notFound } from "./errors.js";
-import { businessFromCrm, findCrmClient, syncBooking, updateCrmVisit, type AiBusiness } from "./crm.js";
+import { businessFromCrm, syncBooking, updateCrmVisit, type AiBusiness } from "./crm.js";
+import { normPhone, phoneInText, phoneOfHandle, resolvePerson } from "./identity.js";
 
 export const COLLECTIONS = ["phrases", "queue", "knowledge", "clients", "bookings", "versions", "events", "settings"] as const;
 export type Collection = (typeof COLLECTIONS)[number];
@@ -189,7 +190,7 @@ const knowledge: Mapping = {
 // ai_clients + ai_client_preferences (services, staff, times, language, notes)
 // + ai_messages (history: the AI keeps the last 14, the database keeps all).
 
-const CLIENT = ["id", "name", "channel", "handle", "lang", "first", "last", "messages", "intents", "services", "staff", "times", "bookings", "cancels", "complaints", "thanks", "mood", "history", "dialog", "notes", "crmClientId"] as const;
+const CLIENT = ["id", "name", "channel", "handle", "lang", "first", "last", "messages", "intents", "services", "staff", "times", "bookings", "cancels", "complaints", "thanks", "mood", "history", "dialog", "notes", "crmClientId", "phone", "person"] as const;
 const HISTORY = 14;
 
 async function readClients(c: Client, where: string, params: unknown[]): Promise<Row[]> {
@@ -206,6 +207,7 @@ async function readClients(c: Client, where: string, params: unknown[]): Promise
       [ids],
     )
   ).rows;
+  const persons = await readPersons(c, [...new Set(list.map((r) => r.crm_client_id).filter(Boolean))]);
   return list.map((r) => {
     const mine = prefs.filter((p) => p.client_id === r.id);
     const map = (kind: string) => Object.fromEntries(mine.filter((p) => p.kind === kind).map((p) => [p.value, p.weight]));
@@ -234,8 +236,53 @@ async function readClients(c: Client, where: string, params: unknown[]): Promise
       dialog: r.dialog,
       ...(notes.length ? { notes } : {}),
       ...(r.crm_client_id ? { crmClientId: r.crm_client_id } : {}),
+      ...(r.phone ? { phone: r.phone } : {}),
+      ...(r.crm_client_id && persons.has(r.crm_client_id) ? { person: persons.get(r.crm_client_id) } : {}),
     } as Row;
   });
+}
+
+/**
+ * The person behind each CRM card: every messenger account of it and what
+ * all of them together say about the client. The AI's own fields stay per
+ * account; this is read-only and is not saved back.
+ */
+async function readPersons(c: Client, crmIds: string[]): Promise<Map<string, Record<string, unknown>>> {
+  const out = new Map<string, Record<string, unknown>>();
+  if (!crmIds.length) return out;
+  const cards = (await c.query(`SELECT client_id, display_name, phone FROM clients WHERE client_id = ANY($1)`, [crmIds])).rows;
+  const accounts = (await c.query(`SELECT id, channel, handle, crm_client_id FROM ai_clients WHERE crm_client_id = ANY($1) ORDER BY first_seen, id`, [crmIds])).rows;
+  const channels = (await c.query(`SELECT client_id, lower(messenger) AS channel, external_user_id AS handle FROM client_channels WHERE client_id = ANY($1) ORDER BY channel_id`, [crmIds])).rows;
+  const prefs = (
+    await c.query(
+      `SELECT a.crm_client_id, p.kind, p.value, sum(p.weight)::int AS weight
+         FROM ai_client_preferences p JOIN ai_clients a ON a.id = p.client_id
+        WHERE a.crm_client_id = ANY($1) GROUP BY 1, 2, 3 ORDER BY 1, 2, 4 DESC, 3`,
+      [crmIds],
+    )
+  ).rows;
+  const visits = (
+    await c.query(`SELECT client_id, count(*)::int AS n FROM appointments WHERE client_id = ANY($1) AND status NOT IN ('Cancelled') GROUP BY 1`, [crmIds])
+  ).rows;
+  for (const card of cards) {
+    const id = card.client_id;
+    const mine = prefs.filter((p) => p.crm_client_id === id);
+    const map = (kind: string) => Object.fromEntries(mine.filter((p) => p.kind === kind).map((p) => [p.value, p.weight]));
+    const t = map("time");
+    out.set(id, {
+      crmClientId: id,
+      name: card.display_name,
+      ...(card.phone ? { phone: normPhone(card.phone) ?? card.phone } : {}),
+      accounts: accounts.filter((a) => a.crm_client_id === id).map((a) => ({ id: a.id, channel: a.channel, handle: a.handle })),
+      channels: channels.filter((ch) => ch.client_id === id).map((ch) => ({ channel: ch.channel, handle: ch.handle })),
+      services: map("service"),
+      staff: map("staff"),
+      times: { morning: t.morning ?? 0, day: t.day ?? 0, evening: t.evening ?? 0 },
+      notes: mine.filter((p) => p.kind === "note").map((p) => p.value),
+      visits: visits.find((v) => v.client_id === id)?.n ?? 0,
+    });
+  }
+  return out;
 }
 
 async function writeClient(c: Client, m: Row): Promise<void> {
@@ -243,17 +290,20 @@ async function writeClient(c: Client, m: Row): Promise<void> {
   const last = date(m.last, first.getTime());
   const channel = str(m.channel, "crm");
   const handle = str(m.handle);
-  const crm = await findCrmClient(c, { id: m.id, channel, handle });
+  // A phone the AI learned, the WhatsApp number itself, or a phone the client wrote in a message.
+  const turns0 = Array.isArray(m.history) ? (m.history as Record<string, unknown>[]) : [];
+  const written = turns0.filter((t) => t.from === "client").map((t) => phoneInText(str(t.text))).find(Boolean) ?? null;
+  const phone = normPhone(m.phone) ?? phoneOfHandle(channel, handle) ?? written;
   await c.query(
-    `INSERT INTO ai_clients (id, crm_client_id, name, channel, handle, lang, first_seen, last_seen, messages, bookings, cancels, complaints, thanks, mood, intents, dialog, extra, updated_at)
+    `INSERT INTO ai_clients (id, phone, name, channel, handle, lang, first_seen, last_seen, messages, bookings, cancels, complaints, thanks, mood, intents, dialog, extra, updated_at)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, now())
-     ON CONFLICT (id) DO UPDATE SET crm_client_id = coalesce(ai_clients.crm_client_id, EXCLUDED.crm_client_id), name = EXCLUDED.name,
+     ON CONFLICT (id) DO UPDATE SET phone = coalesce(EXCLUDED.phone, ai_clients.phone), name = EXCLUDED.name,
        channel = EXCLUDED.channel, handle = EXCLUDED.handle, lang = EXCLUDED.lang, first_seen = EXCLUDED.first_seen, last_seen = EXCLUDED.last_seen,
        messages = EXCLUDED.messages, bookings = EXCLUDED.bookings, cancels = EXCLUDED.cancels, complaints = EXCLUDED.complaints,
        thanks = EXCLUDED.thanks, mood = EXCLUDED.mood, intents = EXCLUDED.intents, dialog = EXCLUDED.dialog, extra = EXCLUDED.extra, updated_at = now()`,
     [
       m.id,
-      crm,
+      phone,
       str(m.name, m.id).slice(0, 80) || m.id,
       channel,
       handle,
@@ -308,6 +358,9 @@ async function writeClient(c: Client, m: Row): Promise<void> {
       [m.id, sender, text, Array.isArray(t.labels) ? t.labels.map(String) : null, date(t.at)],
     );
   }
+
+  // One person, many messengers: link this account to the person's CRM card.
+  await resolvePerson(c, m.id);
 }
 
 const clients: Mapping = {
@@ -327,9 +380,14 @@ const clients: Mapping = {
 // ------------------------------------------------------------------ bookings
 // ai_bookings (synced into CRM appointments) + CRM visits the AI did not make.
 
-const BOOKING = ["id", "client", "clientName", "service", "staff", "start", "minutes", "price", "status", "source", "at", "crmAppointmentId", "crmStatus", "syncStatus", "syncError", "origin"] as const;
-const CAL = `SELECT cal.*, to_char(cal.start_at, 'YYYY-MM-DD"T"HH24:MI') AS start, b.extra, b.sync_status, b.sync_error
-               FROM ai_calendar cal LEFT JOIN ai_bookings b ON cal.origin = 'ai' AND b.id = cal.id`;
+const BOOKING = ["id", "client", "clientName", "service", "staff", "start", "minutes", "price", "status", "source", "at", "crmAppointmentId", "crmStatus", "syncStatus", "syncError", "origin", "crmClientId"] as const;
+// crm_client: the person (CRM card) the visit is for, whichever messenger booked it.
+const CAL = `SELECT cal.*, to_char(cal.start_at, 'YYYY-MM-DD"T"HH24:MI') AS start, b.extra, b.sync_status, b.sync_error,
+                    coalesce(ap.client_id, acl.crm_client_id) AS crm_client
+               FROM ai_calendar cal
+               LEFT JOIN ai_bookings b ON cal.origin = 'ai' AND b.id = cal.id
+               LEFT JOIN appointments ap ON ap.appointment_id = cal.crm_appointment_id
+               LEFT JOIN ai_clients acl ON acl.id = cal.client_id`;
 const bookingRow = (r: Record<string, any>): Row => ({
   ...(r.extra ?? {}),
   id: r.id,
@@ -344,6 +402,7 @@ const bookingRow = (r: Record<string, any>): Row => ({
   source: r.source,
   at: ms(r.created_at),
   ...(r.crm_appointment_id ? { crmAppointmentId: r.crm_appointment_id, crmStatus: r.crm_status } : {}),
+  ...(r.crm_client ? { crmClientId: r.crm_client } : {}),
   ...(r.origin === "ai" ? { syncStatus: r.sync_status, ...(r.sync_error ? { syncError: r.sync_error } : {}) } : { origin: "crm" }),
 });
 const isCrmVisit = (id: string) => /^AP-\d+$/.test(id);

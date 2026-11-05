@@ -7,7 +7,7 @@ services:
     name: voronix-data
     runtime: docker
     plan: free
-    repo: https://github.com/Yernazar-KBTU/voronix-data.git
+    repo: https://github.com/kamilabalabatyr/voronix-data-server.git
     branch: main
     dockerfilePath: ./Dockerfile
     dockerContext: .

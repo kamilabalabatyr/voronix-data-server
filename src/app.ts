@@ -15,6 +15,7 @@ import { LiveHub, type LiveChange } from "./live.js";
 import { COLLECTIONS, isCollection, storeAll, storeGet, storePatch, storePut, storeRemove, syncBusiness, type Collection, type Ctx, type Row } from "./collections.js";
 import { addDocument, deleteDocument, listDocuments, search } from "./knowledge.js";
 import { businessFromCrm } from "./crm.js";
+import { markDistinct, mergeAccounts, normPhone, resolvePerson } from "./identity.js";
 
 declare module "express-serve-static-core" {
   interface Request {
@@ -164,7 +165,8 @@ export function createApp(deps: AppDeps) {
             channels: (await ctx.c.query(`SELECT messenger, external_user_id AS "externalUserId" FROM client_channels WHERE client_id = $1`, [card.crm_client_id])).rows,
           }
         : null;
-      return { card, preferences, bookings, crm };
+      const person = (await storeGet(ctx, "clients", id))?.person ?? null;
+      return { card, preferences, bookings, crm, person };
     });
     res.json(out);
   });
@@ -210,6 +212,55 @@ export function createApp(deps: AppDeps) {
       (await ctx.c.query(`DELETE FROM ai_client_preferences WHERE client_id = $1 AND kind = $2 AND value = $3`, [String(req.params.id), String(req.params.kind), String(req.params.value)])).rowCount,
     );
     if (!n) throw notFound("No such preference");
+    res.json({ ok: true });
+  });
+
+  // ---------------------------------------------------------------- one client, many messengers
+  const exists = async (ctx: Ctx, id: string) => {
+    if (!(await ctx.c.query(`SELECT 1 FROM ai_clients WHERE id = $1`, [id])).rowCount) throw notFound(`Client ${id} does not exist`);
+  };
+  const Other = z.object({ with: z.string().min(1).max(64) });
+
+  /** The client wrote their phone: the same phone in another messenger or in the CRM is the same person. */
+  v1.post("/clients/:id/phone", async (req, res) => {
+    const phone = normPhone((req.body as { phone?: unknown })?.phone);
+    if (!phone) throw badRequest("phone: a phone number, e.g. +7 700 123 45 67");
+    const id = String(req.params.id);
+    const out = await run(req, async (ctx) => {
+      await exists(ctx, id);
+      await ctx.c.query(`UPDATE ai_clients SET phone = $2, updated_at = now() WHERE id = $1`, [id, phone]);
+      await resolvePerson(ctx.c, id);
+      return (await storeGet(ctx, "clients", id))?.person ?? null;
+    });
+    res.json({ phone, person: out });
+  });
+
+  /** Accounts that are probably one person (same name, different messengers) for a person to check. */
+  v1.get("/clients/duplicates", async (req, res) => {
+    res.json({ candidates: await run(req, async (ctx) => (await ctx.c.query(`SELECT * FROM ai_duplicate_candidates ORDER BY client_a, client_b`)).rows) });
+  });
+
+  v1.post("/clients/:id/merge", async (req, res) => {
+    const o = Other.safeParse(req.body);
+    if (!o.success) throw badRequest("Send {\"with\": \"<other client id>\"}");
+    const id = String(req.params.id);
+    const crmClientId = await run(req, async (ctx) => {
+      await exists(ctx, id);
+      await exists(ctx, o.data.with);
+      return mergeAccounts(ctx.c, id, o.data.with);
+    });
+    res.json({ ok: true, crmClientId });
+  });
+
+  v1.post("/clients/:id/not-same", async (req, res) => {
+    const o = Other.safeParse(req.body);
+    if (!o.success) throw badRequest("Send {\"with\": \"<other client id>\"}");
+    const id = String(req.params.id);
+    await run(req, async (ctx) => {
+      await exists(ctx, id);
+      await exists(ctx, o.data.with);
+      await markDistinct(ctx.c, id, o.data.with);
+    });
     res.json({ ok: true });
   });
 
