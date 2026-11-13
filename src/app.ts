@@ -5,6 +5,7 @@
 //  - everything else: what the CRM pages and the team need on top of that
 //                   (client cards and preferences, documents, search,
 //                   training data export, CRM business profile).
+import path from "node:path";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { z } from "zod";
 import type { Config } from "./config.js";
@@ -15,6 +16,7 @@ import { LiveHub, type LiveChange } from "./live.js";
 import { COLLECTIONS, isCollection, storeAll, storeGet, storePatch, storePut, storeRemove, syncBusiness, type Collection, type Ctx, type Row } from "./collections.js";
 import { addDocument, deleteDocument, listDocuments, search } from "./knowledge.js";
 import { businessFromCrm } from "./crm.js";
+import { DASHBOARD_HTML } from "./dashboard.js";
 import { markDistinct, mergeAccounts, normPhone, resolvePerson } from "./identity.js";
 
 declare module "express-serve-static-core" {
@@ -61,6 +63,16 @@ export function createApp(deps: AppDeps) {
     }
     if (req.method === "OPTIONS") return void res.sendStatus(204);
     next();
+  });
+
+  // The analytics dashboard: a plain page; it asks for the API key and reads /v1/analytics.
+  app.get(["/", "/dashboard"], (_req, res) => {
+    res.type("html").send(DASHBOARD_HTML);
+  });
+  // Chart.js from our own server: the dashboard works without outside CDNs.
+  app.get("/chart.umd.js", (_req, res) => {
+    res.setHeader("Cache-Control", "public, max-age=86400");
+    res.type("js").sendFile(path.join(process.cwd(), "node_modules/chart.js/dist/chart.umd.js"));
   });
 
   app.get("/health", async (_req, res) => {
@@ -336,6 +348,25 @@ export function createApp(deps: AppDeps) {
         (await ctx.c.query(`SELECT coalesce(sum(pg_total_relation_size(format('%I.%I', schemaname, tablename))), 0) AS b FROM pg_tables WHERE schemaname = $1 AND tablename LIKE 'ai\\_%'`, [ctx.tenant.schema])).rows[0].b,
       );
       return { counts, bookingSync: Object.fromEntries(sync.map((r) => [r.sync_status, r.n])), bytes };
+    });
+    res.json(out);
+  });
+
+  // ---------------------------------------------------------------- analytics
+  // Every analytics_* view of the business (db/migrations/tenant/005_analytics.sql).
+  v1.get("/analytics", async (req, res) => {
+    const out = await run(req, async (ctx) => {
+      const q = async (sql: string) => (await ctx.c.query(sql)).rows;
+      return {
+        business: req.tenant!.name,
+        services: await q(`SELECT * FROM analytics_services ORDER BY revenue DESC, service`),
+        masters: await q(`SELECT * FROM analytics_masters ORDER BY revenue DESC, master`),
+        channels: await q(`SELECT * FROM analytics_channels ORDER BY bookings DESC`),
+        weekdays: await q(`SELECT * FROM analytics_weekdays ORDER BY weekday`),
+        months: await q(`SELECT * FROM analytics_months ORDER BY month`),
+        funnel: await q(`SELECT * FROM analytics_funnel ORDER BY chats DESC`),
+        aiQuality: await q(`SELECT * FROM analytics_ai_quality ORDER BY version`),
+      };
     });
     res.json(out);
   });
