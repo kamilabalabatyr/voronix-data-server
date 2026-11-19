@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { startEnv, type TestEnv } from "./helpers.js";
+import { futureCrmVisit, startEnv, type TestEnv } from "./helpers.js";
 import type { ServerStore } from "../client/server-store.js";
 
 let env: TestEnv;
@@ -218,9 +218,9 @@ describe("bookings become CRM appointments", () => {
     const all = await store.all("bookings");
     const crm = all.filter((b) => b.origin === "crm");
     expect(crm.length).toBeGreaterThan(5);
-    const future = (await env.sql(`SELECT appointment_id FROM appointments WHERE status = 'Booked' AND start_at > LOCALTIMESTAMP AND appointment_id NOT IN (SELECT crm_appointment_id FROM ai_bookings WHERE crm_appointment_id IS NOT NULL) LIMIT 1`))[0];
-    await store.patch("bookings", future.appointment_id, { status: "cancelled" });
-    expect((await env.sql(`SELECT status FROM appointments WHERE appointment_id = $1`, [future.appointment_id]))[0].status).toBe("Cancelled");
+    const ap = await futureCrmVisit(env);
+    await store.patch("bookings", ap, { status: "cancelled" });
+    expect((await env.sql(`SELECT status FROM appointments WHERE appointment_id = $1`, [ap]))[0].status).toBe("Cancelled");
   });
 
   it("a booking that arrives before its client still has a client", async () => {

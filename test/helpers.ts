@@ -130,6 +130,23 @@ export async function startEnv(env: Partial<NodeJS.ProcessEnv> = {}): Promise<Te
   };
 }
 
+/**
+ * A CRM visit with status Booked that is always in the future (relative to
+ * today), so tests never depend on the dates in the demo fixtures (R1).
+ * It copies client, master and service from an existing demo visit.
+ */
+export async function futureCrmVisit(env: TestEnv, daysAhead = 400): Promise<string> {
+  const [row] = await env.sql(
+    `INSERT INTO appointments (client_id, master_id, service_code, start_at, end_at, status, source)
+     SELECT client_id, master_id, service_code,
+            LOCALTIMESTAMP::date + $1::int + TIME '10:00', LOCALTIMESTAMP::date + $1::int + TIME '11:00', 'Booked', 'Admin'
+       FROM appointments ORDER BY appointment_id LIMIT 1
+     RETURNING appointment_id`,
+    [daysAhead],
+  );
+  return row.appointment_id;
+}
+
 export const until = async (check: () => boolean, ms = 3000) => {
   const end = Date.now() + ms;
   while (!check()) {

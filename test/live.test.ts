@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { startEnv, until, type TestEnv } from "./helpers.js";
+import { futureCrmVisit, startEnv, until, type TestEnv } from "./helpers.js";
 import type { Change, Row } from "../client/store.js";
 
 let env: TestEnv;
@@ -36,8 +36,8 @@ describe("live changes", () => {
     let rows: Row[] = [];
     s.watch("bookings", (r) => (rows = r));
     await until(() => rows.length > 0);
-    const ap = (await env.sql(`SELECT appointment_id FROM appointments WHERE status = 'Booked' AND start_at > LOCALTIMESTAMP LIMIT 1`))[0].appointment_id;
-    expect(rows.find((r) => r.id === ap)?.status).toBe("booked");
+    const ap = await futureCrmVisit(env);
+    await until(() => rows.find((r) => r.id === ap)?.status === "booked");
     await env.sql(`UPDATE appointments SET status = 'Cancelled' WHERE appointment_id = $1`, [ap]);
     await until(() => rows.find((r) => r.id === ap)?.status === "cancelled");
   });
