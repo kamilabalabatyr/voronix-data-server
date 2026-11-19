@@ -30,19 +30,40 @@ export interface BookingForSync {
 }
 
 /**
+ * What each CRM_SYNC mode does when the CRM cannot take a booking (Strategy).
+ * The sync steps below are the same for every mode; only these decisions differ.
+ * A busy slot (23P01) always refuses the booking, whatever the mode.
+ */
+export interface SyncPolicy {
+  /** false: never touch CRM appointments. */
+  readonly writesToCrm: boolean;
+  /** The CRM has no such master/service pair: refuse the AI booking too? */
+  readonly refuseUnsupported: boolean;
+  /** The CRM rejected the write with this error: refuse the AI booking too? */
+  refusesOn(err: unknown): boolean;
+}
+
+const slotTaken = (err: unknown) => (err as { code?: string })?.code === "23P01";
+
+export const SYNC_POLICIES: Record<CrmSync, SyncPolicy> = {
+  loose: { writesToCrm: true, refuseUnsupported: false, refusesOn: slotTaken },
+  strict: { writesToCrm: true, refuseUnsupported: true, refusesOn: () => true },
+  off: { writesToCrm: false, refuseUnsupported: false, refusesOn: () => false },
+};
+
+/**
  * Writes an AI booking into CRM appointments (inside the caller's
- * transaction, behind a savepoint). A busy slot always refuses the booking;
- * other CRM refusals depend on CRM_SYNC.
+ * transaction, behind a savepoint). Which CRM refusals also refuse the
+ * booking is decided by the SYNC_POLICIES entry for CRM_SYNC.
  */
 export async function syncBooking(c: Client, b: BookingForSync, mode: CrmSync): Promise<void> {
-  if (mode === "off") return;
+  const policy = SYNC_POLICIES[mode];
+  if (!policy.writesToCrm) return;
   const known = await c.query(`SELECT 1 FROM master_services WHERE master_id = $1 AND service_code = $2`, [b.staff, b.service]);
   if (!known.rowCount) {
-    await c.query(`UPDATE ai_bookings SET sync_status = 'skipped', sync_error = $2 WHERE id = $1`, [
-      b.id,
-      `CRM has no master ${b.staff} doing service ${b.service}`,
-    ]);
-    if (mode === "strict") throw conflict(`CRM has no master ${b.staff} doing service ${b.service}`);
+    const reason = `CRM has no master ${b.staff} doing service ${b.service}`;
+    await c.query(`UPDATE ai_bookings SET sync_status = 'skipped', sync_error = $2 WHERE id = $1`, [b.id, reason]);
+    if (policy.refuseUnsupported) throw conflict(reason);
     return;
   }
   await c.query("SAVEPOINT crm_sync");
@@ -82,8 +103,7 @@ export async function syncBooking(c: Client, b: BookingForSync, mode: CrmSync): 
     await c.query("RELEASE SAVEPOINT crm_sync");
   } catch (e) {
     await c.query("ROLLBACK TO SAVEPOINT crm_sync");
-    const code = (e as { code?: string }).code;
-    if (code === "23P01" || mode === "strict") throw e;
+    if (slotTaken(e) || policy.refusesOn(e)) throw e;
     await c.query(`UPDATE ai_bookings SET sync_status = 'failed', sync_error = $2 WHERE id = $1`, [b.id, (e as Error).message.slice(0, 500)]);
   }
 }
