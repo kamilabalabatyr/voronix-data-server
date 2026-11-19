@@ -14,7 +14,25 @@ export const BIZ_A = "23dcb12c-5e0e-42bb-beeb-2a4318abd8a5"; // Barberista (demo
 export const BIZ_B = "0b0b0b0b-1111-4222-8333-444455556666"; // empty business
 const fx = (f: string) => readFileSync(new URL(`./fixtures/${f}`, import.meta.url), "utf8");
 
+const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+
+/**
+ * The tests DROP and recreate their database. Refuse anything that is not a
+ * local database whose name ends with _test, so a wrong TEST_DATABASE_URL
+ * (for example a copied production URL) can never wipe real data.
+ */
+export function assertSafeTestDatabase(url: string): void {
+  const u = new URL(url);
+  const name = decodeURIComponent(u.pathname.slice(1));
+  if (!LOCAL_HOSTS.has(u.hostname) || !name.endsWith("_test")) {
+    throw new Error(
+      `Refusing to drop database "${name}" on host "${u.hostname}": tests only use a local database whose name ends with _test. Check TEST_DATABASE_URL.`,
+    );
+  }
+}
+
 export async function freshDatabase(url: string): Promise<void> {
+  assertSafeTestDatabase(url);
   const u = new URL(url);
   const name = u.pathname.slice(1);
   u.pathname = "/postgres";
