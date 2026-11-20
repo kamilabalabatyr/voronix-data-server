@@ -1,0 +1,56 @@
+# Nightly backup of the whole database (CRM + AI data) from Render.
+# Secrets (Settings → Secrets and variables → Actions):
+#   DATABASE_URL       External Database URL from Render, ending with ?sslmode=require
+#   BACKUP_PASSPHRASE  any long password; the backup is encrypted with it
+# The file holds clients' names, phones and chats, so it is encrypted before upload
+# and kept for 14 days. Restore: see README, "Автоматический бэкап".
+name: backup
+
+on:
+  schedule:
+    - cron: "17 22 * * *" # every night at 03:17 Almaty time
+  workflow_dispatch: # "Run workflow" button for a backup right now
+
+jobs:
+  backup:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Install pg_dump 16
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client-16
+          echo "/usr/lib/postgresql/16/bin" >> "$GITHUB_PATH"
+
+      - name: Dump the database
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          if [ -z "$DATABASE_URL" ]; then echo "Secret DATABASE_URL is not set" >&2; exit 1; fi
+          FILE="voronix-$(TZ=Asia/Almaty date +%Y-%m-%d_%H%M).dump"
+          pg_dump --format=custom --no-owner --no-privileges --file="$FILE" "$DATABASE_URL"
+          echo "FILE=$FILE" >> "$GITHUB_ENV"
+
+      - name: Check the backup is whole
+        run: |
+          TABLES=$(pg_restore --list "$FILE" | grep -c ' TABLE ')
+          echo "Saved $FILE ($(du -h "$FILE" | cut -f1)), tables: $TABLES"
+          if [ "$TABLES" -lt 10 ]; then echo "Too few tables, the backup is broken" >&2; exit 1; fi
+          echo "### Backup $FILE: $TABLES tables, $(du -h "$FILE" | cut -f1)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Encrypt
+        env:
+          BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+        run: |
+          if [ -z "$BACKUP_PASSPHRASE" ]; then echo "Secret BACKUP_PASSPHRASE is not set" >&2; exit 1; fi
+          gpg --batch --yes --pinentry-mode loopback --passphrase "$BACKUP_PASSPHRASE" \
+              --symmetric --cipher-algo AES256 --output "$FILE.gpg" "$FILE"
+          rm "$FILE"
+
+      - name: Keep for 14 days
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.FILE }}
+          path: ${{ env.FILE }}.gpg
+          retention-days: 14
+          if-no-files-found: error

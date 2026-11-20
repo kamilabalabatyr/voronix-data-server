@@ -166,6 +166,22 @@ pg_restore --no-owner --no-privileges -d 'postgresql://…новая база…
 ```
 Бесплатная база Render удаляется через 30 дней, поэтому бэкап нужно сделать до этого срока.
 
+### Автоматический бэкап
+
+GitHub Actions ([backup.yml](.github/workflows/backup.yml)) делает бэкап каждую ночь в 03:17 по Алматы и хранит его 14 дней. Файл шифруется паролем, потому что в нём персональные данные клиентов.
+
+Настройка, один раз: GitHub → Settings → Secrets and variables → Actions → New repository secret:
+- `DATABASE_URL` — External Database URL из Render с `?sslmode=require`;
+- `BACKUP_PASSPHRASE` — любой длинный пароль (без него файл не расшифровать).
+
+Бэкап прямо сейчас: Actions → backup → Run workflow. Файл появится внизу страницы запуска, в Artifacts.
+
+Восстановление: скачать и распаковать zip, затем
+```bash
+gpg --decrypt voronix-ГГГГ-ММ-ДД_ЧЧММ.dump.gpg > voronix.dump
+pg_restore --no-owner --no-privileges -d 'postgresql://…новая база…' voronix.dump
+```
+
 ## Деплой на Render
 
 Добавить сервис из [render.yaml](render.yaml) в `render.yaml` CRM: он использует ту же базу `voronix-db`. После деплоя в Shell сервиса: `node dist/src/cli/keys.js create Barberista`, ключ вписать в ИИ.
